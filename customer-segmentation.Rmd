@@ -1,0 +1,977 @@
+---
+title: "Customer Segmentation for Targeted Marketing"
+author: "Akshit Jain"
+date: "5/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(tidyverse)
+library(DataExplorer)
+library(lubridate)
+library(agricolae)
+library(sf)
+library(raster)
+library(dplyr)
+library(spData)
+library(tm)
+library(tmap)
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering algorithms & visualization
+library(FactoMineR)
+library(wordcloud)
+library(httr)
+library(xml2)
+library(rvest)
+library(doParallel)
+library(fmsb)
+library(scales)
+library(rpart)
+library(rpart.plot)
+library(kableExtra)
+```
+
+
+```{r image1, echo=FALSE, out.width = '100%'}
+knitr::include_graphics("customer-seg-img.jpg")
+```
+
+# Introduction
+
+Customer segmentation is the process of dividing customers into groups based on common characteristics so companies can market to each group effectively and appropriately.
+
+From knowing which products to buy, how many of them and when, to marketing the right products to the right customers at the right time, there are plenty of uses for data in retail - from the biggest multi-nationals to the smallest, single-outlet shop. By analysing customer purchase and product sales history, we can group products and customers into groups that behave similarly, and make data-driven business decisions that can improve a wide range of inventory and sales key performance indicators (KPIs). 
+
+The specific data for this analysis comes from the UCI Machine Learning Repository and represents transactional data from a UK retailer from 2010-2011. This mostly represents sales to wholesalers so it is slightly different from consumer purchase patterns but is still a useful case study.
+
+**Note:** To access the code for this project, kindly check out the GitHub repository linked below.
+
+# Scope
+
+ 1. Analyze the sales trends, market profitability, order cancellations and product categories through exporatory data analysis. 
+ 
+ 2. Leverage the product descriptions to better understand what product categories interest our customers the most.
+ 
+ 3. Implement K-means and Hierarchical clustering algorithms to segment customers in order to gain insight into shopping behaviors, analyze product affinity, measure marketing effectiveness, and better allocate future marketing spend.
+
+# Data Preparation
+
+Let's start by loading the dataset and get a feel for its size and the class of each variable:
+
+```{r prepare-data-1, echo=FALSE, warning=FALSE, results='asis'}
+initial_df = read_csv("data.csv", col_types = cols())
+initial_df$CustomerID = as.character(initial_df$CustomerID)
+
+kable(initial_df[1:5, ], caption = "A glimpse of the dataset") %>% kable_styling()
+```
+
+The shape of the dataframe is: `r dim(initial_df)`
+
+```{r prepare-data-1.1, echo=FALSE, warning=FALSE}
+options(repr.plot.width=8, repr.plot.height=3)
+# look for missing values using the DataExplorer package
+plot_missing(initial_df, 
+             geom_label_args = list("size" = 3, "label.padding" = unit(0.1, "lines")),
+             ggtheme = theme_minimal())
+```
+
+Looking at the size of the dataset and the missing value plot, it is interesting to note that ∼ 25% of the entries are not assigned to a particular customer, if we can remove the missing values we can still have a good-sized set of data to work on. Moreover, with the data available, it is impossible to impute values for the customers and these entries are thus useless for our analysis, so let's start by removing the missing values:
+
+```{r prepare-data-1.2, echo=FALSE, warning=FALSE}
+initial_df = na.omit(initial_df)
+
+options(repr.plot.width=8, repr.plot.height=3)
+# look for missing values using the DataExplorer package
+plot_missing(initial_df, 
+             geom_label_args = list("size" = 3, "label.padding" = unit(0.1, "lines")),
+             ggtheme = theme_minimal())
+```
+
+The shape of the dataframe after removing NA values: `r dim(initial_df)`
+
+# Feature Engineering 
+
+Variables that pop out are <b>InvoiceDate</b>, <b>Quantity</b> and <b>Unit Price</b>. 
+
+- <b>InvoiceDate</b> is a character variable, but we can pull out the date and time information to create two new variables. We'll also create separate variables for month, year and hour of day.
+
+- <b>Quantity</b> and <b>Unit Price</b> will be used to create a column <b>BasketPrice</b>.
+
+```{r prepare-data-1.3, echo=FALSE, warning=FALSE, results='asis'}
+
+initial_df = separate(initial_df, col = c("InvoiceDate"),
+                      into = c("InvoiceDate", "InvoiceTime"), sep = " ")
+
+initial_df = separate(initial_df, col = c("InvoiceDate"),
+                      into = c("Month", "Day", "Year"), sep = "/",
+                      remove = FALSE)
+
+initial_df = initial_df %>% dplyr::select(-Day)
+
+initial_df = separate(initial_df, col = c("InvoiceTime"),
+                      into = c("HourOfDay", "Minutes"), sep = ":",
+                      remove = FALSE)
+
+initial_df = initial_df %>% dplyr::select(-Minutes)
+
+initial_df$InvoiceDate = as.Date(initial_df$InvoiceDate, "%m/%d/%Y")
+
+initial_df$DayOfWeek = wday(initial_df$InvoiceDate, label = TRUE)
+
+initial_df = initial_df %>% mutate(BasketPrice = Quantity * UnitPrice)
+
+# Finally, I check for duplicate entries and delete them:
+initial_df = dplyr::distinct(initial_df)
+
+initial_df$Country <- as.factor(initial_df$Country)
+initial_df$Month<- as.factor(initial_df$Month)
+initial_df$Year <- as.factor(initial_df$Year)
+levels(initial_df$Year) <- c(2010,2011)
+initial_df$HourOfDay<- as.factor(initial_df$HourOfDay)
+initial_df$DayOfWeek <- as.factor(initial_df$DayOfWeek)
+
+kable(initial_df[1:5, ], caption = "Dataset with new features added") %>%
+   kable_styling(font_size = 8)
+
+```
+
+We now have a good dataframe to explore and analyze the sales trends, market profitability, order cancellations and product categories. Before we move on to getting involved with extracting product categories and perform customer segmentation, we'll look at some of the bigger features of the dataset. 
+
+# Exploratory Data Analysis
+
+This dataframe contains 8 features + 6 engineered features = 14 features that correspond to:
+
+- <b>InvoiceNo:</b> Invoice number. *Nominal*, a 6-digit integral number uniquely assigned to each transaction. If this code starts with letter 'C', it indicates a cancellation.
+
+- <b>StockCode:</b> Product (item) code. *Nominal*, a 5-digit integral number uniquely assigned to each distinct product.
+
+- <b>Description:</b> Product (item) name. *Nominal*.
+
+- <b>Quantity:</b> The quantities of each product (item) per transaction. Numeric.
+
+- <b>InvoiceDate:</b> Invice Date and time. *Date*, the day and time when each transaction was generated.
+
+- <b>UnitPrice:</b> Unit price. *Numeric*, Product price per unit in sterling.
+
+- <b>CustomerID:</b> Customer number. *Nominal*, a 5-digit integral number uniquely assigned to each customer.
+
+- <b>Country:</b> Country name. *Nominal*, the name of the country where each customer resides.
+
+Summary of engineered features: <b>Month</b>, <b>Year</b>, <b>InvoiceTime</b>, <b>HourOfDay</b>, <b>DayOfWeek</b>, <b>BasketPrice</b>
+
+### Revenue By Date
+
+```{r explore-data-1, echo=FALSE, warning=FALSE}
+initial_df %>%
+  group_by(InvoiceDate) %>% summarise(Revenue = sum(BasketPrice)) %>%
+  ggplot(aes(x = InvoiceDate, y = Revenue)) + 
+  geom_line() +
+  geom_smooth(formula = y~x, method = "loess", se = TRUE) +
+  labs(x = "Date", y = "Revenue (£)", title = "Sales Revenue by Date")
+```
+
+It appears as though sales are trending up, so that's a good sign, but that doesn't really generate any actionable insight, so let's dive into the data a bit farther.
+
+### Day of Week Analysis
+
+Using the *lubridate* package, we assigned a day of the week to each date in our dataset. Generally, people tend to be in a different frame of mind as the week goes on. Are people more likely to spend as the week goes on? Browsing to pass a Sunday afternoon? Procrastinating on that Friday afternoon at work? Cheering yourself up after a difficult Monday? Also, since a lot of our customers are wholesale buyers, do they fill up their inventories on a regular basis? Is there a pattern in their purchasing history?
+
+Let's drill into the days of the week side of our data and see what we can uncover about our sales trends.
+
+```{r explore-data-1.1, echo=FALSE, warning=FALSE}
+initial_df %>%
+  group_by(DayOfWeek) %>% summarise(Revenue = sum(BasketPrice)) %>%
+  ggplot(aes(x = DayOfWeek, y = Revenue)) + 
+  geom_bar(stat = "identity", fill = 'steelblue') +
+  labs(x = "Day of Week", y = "Revenue (£)", title = "Sales Revenue by Day of Week")
+```
+
+It looks like there could be something interesting going on with the amount of revenue that is generated on each particular weekday. What about Saturday? Let's drill into this a little bit more by creating a new dataframe that we can use to look at what's going on at the day of the week level in a bit more detail:
+
+```{r explore-data-1.2, echo=FALSE, warning=FALSE, results='asis'}
+weekday_summary = initial_df %>%
+  group_by(InvoiceDate, DayOfWeek) %>%
+  summarise(Revenue = sum(BasketPrice), Transactions = n_distinct(InvoiceNo)) %>%
+  mutate(AverageOrderVal = round((Revenue/ Transactions), 2)) %>%
+  ungroup()
+
+kable(weekday_summary[1:5, ], caption = "Summary of  Weekday Transactions") %>%
+  kable_styling()
+```
+
+We now have a dataframe that summarises what is happening on each day, with our *DayOfWeek* present and a few of newly engineered variables, daily *Revenue*, *Transactions* and *AverageOrderVal*, we can drill into our data a bit more thoroughly.
+
+```{r explore-data-1.3, echo=FALSE, warning=FALSE}
+weekday_summary %>%
+  ggplot(aes(x = DayOfWeek, y = Revenue)) + 
+  geom_boxplot() + 
+  labs(x = "Day of Week", y = "Revenue (£)", title = "Sales Revenue by Day of Week")
+```
+
+```{r explore-data-1.4, echo=FALSE, warning=FALSE}
+weekday_summary %>%
+  ggplot(aes(x = DayOfWeek, y = Transactions)) + 
+  geom_boxplot() + 
+  labs(x = "Day of Week", y = "Transactions", title = "Number of Transactions by Day of Week")
+```
+
+```{r explore-data-1.5, echo=FALSE, warning=FALSE}
+weekday_summary %>%
+  ggplot(aes(x = DayOfWeek, y = AverageOrderVal)) + 
+  geom_boxplot() + 
+  labs(x = "Day of Week", y = "Average Order Value (£)", 
+       title = "Number of Transactions by Day of Week")
+```
+
+Eye-balling the plots, it looks as though there are differences in the amount of revenue on each day of the week, and that this difference is driven by a difference in the number of transactions, rather than the average order value. Apparently, there are no transactions on Saturdays. The retailer might not be accepting orders that day. 
+
+Let's plot the data as a density plot to get a better feel for how the data is distributed across the days.
+
+```{r explore-data-1.6, echo=FALSE, warning=FALSE}
+weekday_summary %>% 
+  ggplot(aes(Transactions, fill = DayOfWeek)) + 
+  geom_density(alpha = 0.2)
+```
+
+There appears to be a reasonable amount of skewness in our distributions, so we'll use a non-parametric test to look for statistically significant differences in our data.
+
+```{r explore-data-1.7, echo=FALSE, warning=FALSE}
+kruskal.test(weekday_summary$Transactions ~ weekday_summary$DayOfWeek, data = weekday_summary)
+```
+
+The null hypothesis of the Kruskal–Wallis test is that the mean ranks of the groups are the same, the alternative is that they differ in at least one.
+
+The p-value obtained from performing the test is significantly small, hence we reject the null hypothesis and conclude that the mean ranks of the groups are significantly different.
+
+```{r explore-data-1.8, echo=FALSE, warning=FALSE}
+kruskal(weekday_summary$Transactions, weekday_summary$DayOfWeek, console = FALSE)
+```
+
+#### Conclusions from Day of Week Analysis
+
+Analyzing the data at the weekday level, we can observe that there are statistically significant differences in the number of transactions that take place on different days of the week, with Sunday having the lowest number of transactions, and Thursday the highest. As the average order value remains relatively constant, the number of transactions explain the difference in revenue.
+
+Given the low number of transactions on a Sunday and a high number on a Thursday, we could make recommendations around our digital advertising spend. Should we spend less on a Sunday and more on a Thursday, given that we know we already have more transactions, which could suggest people are more ready to buy on Thursdays? Possible, but without knowing other key metrics, it might be a bit hasty to say.
+
+While this data does reveal insight, in order to be truly actionable, we would want to combine this with more information. In particular, combining these data with web analytics data would be hugely valuable. How do these data correlate with web traffic figures? Does the conversion rate change or is there just more traffic on a Thursday and less on a Sunday?
+
+What about out current advertising spend? Is the company already spending less on a Sunday and more on a Thursday and that is behind our observed differences? What about buying cycles? How long does it take for a customer to go from thinking about buying something to buying it? If it's usually a couple of days, should we advertise more on a Tuesday? Should we continue with an increased spend on a Thursday, when they're ready to buy, and let our competitors pay for the clicks while the customer is in the 'research' stage of the process?
+
+These types of questions illustrate the importance of understanding the vertical, the business model and other factors and decisions which underpin the dataset, rather than just looking at the dataset in isolation.
+
+### Hour of Day Analysis
+
+In a similar way to the day-of-the-week analysis, is there insight to be had from looking at the hours of the day?
+
+```{r explore-data-1.9, echo=FALSE, warning=FALSE}
+initial_df %>%
+  group_by(HourOfDay) %>% 
+  summarise(Revenue = sum(BasketPrice)) %>%
+  ggplot(aes(x = HourOfDay, y = Revenue)) +
+  geom_bar(stat = "identity", fill = 'steelblue') +
+  labs(x = "Hour of Day", y = "Revenue(£)", title = "Revenue by Hour of Day")
+
+```
+
+```{r explore-data-2.0, echo=FALSE, warning=FALSE}
+initial_df %>%
+  group_by(HourOfDay) %>% 
+  summarise(Transactions = n_distinct(InvoiceNo)) %>%
+  ggplot(aes(x = HourOfDay, y = Transactions)) +
+  geom_bar(stat = "identity", fill = 'steelblue') +
+  labs(x = "Hour of Day", y = "Transactions", title = "Transactions by Hour of Day")
+
+```
+
+#### Conclusions from Hour of Day Analysis
+
+It certainly seems as though there is something going on here. We have more transactions and more revenue in the morning to mid-afternoon, tailing of quickly towards the early evening. There are also some hours missing, so that's something else that would also need looking into. Are there genuinely no transactions during these times, or is something else at work?
+
+Based on examining the transactions in the dataset we can comfirm a strong presenece of wholesalers, hence it makes sense to observe more number of transactions / higher revenue during the usual working hours.
+
+### Market Profitability Analysis
+
+Our e-commerce retailer ships to a number of countries around the world. Let's drill into the data from that perspective and see what we can find out. 
+
+```{r explore-data-2.1, echo=FALSE, warning=FALSE, message=FALSE}
+
+customers_world = 
+  left_join(world, initial_df, by=c("name_long" = "Country"))
+
+world_df = customers_world %>%  dplyr::select(iso_a2, name_long, InvoiceNo) %>% 
+  na.omit(world_df) %>% 
+  group_by(name_long) %>% summarise(Transactions = n_distinct(InvoiceNo))
+
+tmap_mode("view")
+tm_shape(world_df) + 
+  tm_polygons("Transactions", breaks = c(0, 10, 100, 500, 1000, 20000))
+
+```
+
+We see that the dataset is largely dominated by orders made from the UK.
+
+```{r explore-data-2.2, echo=FALSE, warning=FALSE, results='asis'}
+country_summary = initial_df %>%
+  group_by(Country) %>%
+  summarise(Revenue = sum(BasketPrice), Transactions = n_distinct(InvoiceNo)) %>%
+  mutate(AverageOrderVal = round((Revenue/ Transactions), 2)) %>% 
+  arrange(desc(Revenue)) %>%
+  ungroup()
+
+kable(country_summary[1:10, ], caption = "Transaction summary across different countries") %>%
+  kable_styling()
+```
+
+```{r explore-data-2.3, echo=FALSE, warning=FALSE, results='asis'}
+country_customer_summary = initial_df %>%
+  group_by(Country) %>%
+  summarise(Revenue = sum(BasketPrice), Customers = n_distinct(CustomerID)) %>%
+  mutate(AverageCustomerSpend = round((Revenue/ Customers), 2)) %>% 
+  arrange(desc(Revenue)) %>%
+  ungroup()
+
+kable(country_customer_summary [1:10, ], caption = "Customer summary across different countries") %>%
+  kable_styling()
+
+```
+
+Plenty to see there, ceratinly. A lot of different countries contributing a good amount of revenue. As it seems that refunds and/or cancellations are present in the dataset as revenue with a negative value, we can assume that the revenue figures here are net of refunds; something that is important to consider when shipping goods overseas. However, additional information on the costs incurred dealing with these refunds would allow us to make more appropriate recommendations.
+
+Let's begin by looking at the top five countries in terms of revenue contribution. We'll exclude the UK as we are based in the UK, so improving UK performance will undoubtedly already be on the radar.
+
+```{r explore-data-2.4, echo=FALSE, warning=FALSE}
+top5_countries = initial_df %>%
+  filter(Country == 'Netherlands' | 
+           Country == 'EIRE' | 
+           Country == 'Germany' | 
+           Country == 'France' | 
+           Country == 'Australia')
+
+top5_countries_summaries = 
+  top5_countries %>%
+  group_by(Country, InvoiceDate) %>%
+  summarise(Revenue = sum(BasketPrice), 
+            Transactions = n_distinct(InvoiceNo), 
+            Customers = n_distinct(CustomerID)) %>%
+  mutate(AverageOrderVal = round((Revenue/ Transactions), 2)) %>%
+  arrange(InvoiceDate) %>%
+  ungroup()
+```
+
+Looking at the top five non-UK by revenue, the lowest number of transactions is 69 (Australia), which, given the time period of the dataset, is still a regular number of transactions, so the inclusion of these countries seems justified
+
+```{r explore-data-2.5, echo=FALSE, warning=FALSE}
+top5_countries_summaries %>% 
+  ggplot(aes(x = Country, y = Revenue)) +
+  stat_summary(fun.y = sum, geom = "bar", fill = "steelblue", colour = "black") +
+  labs(x = "Country", y = "Revenue(£)", title = "Revenue by Country")
+```
+
+```{r explore-data-2.6, echo=FALSE, warning=FALSE}
+top5_countries_summaries %>% 
+  ggplot(aes(x = InvoiceDate, y = Revenue, color = Country)) +
+  geom_smooth(formula = y~x, method = "loess", se = FALSE) +
+  labs(x = "Date", y = "Revenue(£)", title = "Year-on-Year Sales Revenue by Country")
+```
+
+```{r explore-data-2.7, echo=FALSE, warning=FALSE}
+top5_countries_summaries %>% 
+  ggplot(aes(x = Country, y = AverageOrderVal)) +
+  geom_boxplot() +
+  labs(x = "Country", y = "Average Order Value (£)", title = "Average Order Value by Country")
+```
+
+```{r explore-data-2.8, echo=FALSE, warning=FALSE}
+top5_countries_summaries %>% 
+  ggplot(aes(x = Country, y = Transactions)) +
+  geom_boxplot() +
+  labs(x = "Country", y = "Transactions", title = "Number of Daily Transactions by Country")
+```
+
+#### Conclusions from Market Profitablity Analysis
+
+These simple analyses show that there are opportunities. Revenue in EIRE seems to be driven by 3 customers, who buy regularly and have a good average order value, but EIRE revenue has been declining recently. Given the small number of customers and high revenue, a bespoke email or promotion to these customers may drive loyalty and get them buying again.
+
+The Netherlands has also been a significant source of revenue, but another which has been declining in the last few months of the dataset. Further research into this (marketing campaign activity and web analytics data) may provide further insight into why this may be the case, but it does appear that, as customers in the Netherlands have shown a willingness to purchase in the past, the country represents a good opportunity to market in order build a loyal customer base.
+
+France and Germany represent significant opportunities. Revenue from these countries has been rising, and the number of daily transactions is [relatively] strong. Marketing campaigns which aim to improve this while increasing average transaction values may be of significant benefit.
+
+### Business Insights
+
+```{r explore-data-2.9, echo=FALSE, warning=FALSE, results='asis'}
+overall_info = initial_df %>% 
+  summarise(NumberOfProducts = n_distinct(Description),
+            NumberOfTransactions = n_distinct(InvoiceNo),
+            NumberOfCustomers = n_distinct(CustomerID))
+kable(overall_info, caption = "Business Statistics") %>% kable_styling()
+```
+
+It can be seen that the data contains 4372 customers who have bought 3885 different products. The total number of transactions carried out is ∼ 22000.
+
+Next, let's find out the number of products purchased in every transaction:
+
+```{r explore-data-3.0, echo=FALSE, warning=FALSE, results='asis'}
+customer_trans = initial_df %>% 
+  group_by(CustomerID, InvoiceNo) %>%
+  summarise(NumberOfProducts = n())
+kable(customer_trans[1:10, ], 
+      caption = "Glimpse of number of items purchased per transactions") %>% kable_styling()
+  
+```
+
+From the the first few lines of the table above we can observe interesting shopping patterns:
+
+-  The existence of entries with the prefix 'C' for the InvoiceNo variable: this indicates transactions that have been cancelled.
+
+- The existence of customers who only shopped once and purchased only one product
+(e.g. CustomerID: 12346).
+
+- The existence of frequent customers who buy a large number of items at each order.
+
+**Who is our most profitable customer?**
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+most_revenue = initial_df %>% group_by(CustomerID, Country) %>% 
+  summarise(SalesRevenueContribution = sum(BasketPrice)) %>%
+  arrange(desc(SalesRevenueContribution))
+
+kable(most_revenue[1:5, ], 
+      caption = "Summary of contribution to sales revenue (£)") %>% kable_styling()
+```
+As we can see from the table above, **CustomerID: 14646** from Netherlands contributes the most to our sales revenue, folled by **CustomerID: 18102** from the UK. 
+
+Interesting thing to note here is that we have 9 customers from Netherlands who collectively contribute **£284,661.54** to our sales, out of which **CustomerID: 14646 contributes ~98%**. 
+
+The same thing can be said about **CustomerID: 12414** from Australia, they contribute **~90%** of Australia's contribution to sales. 
+
+As mentioned plently of times already, this shows the presenece of wholesale buyers in our dataset. This is one of the reasons why it is all the more important to carefully segment our customers so that we can provide them with information they will be most interested in consuming. The segmentation will further allow us as online retailers to make better marketing decisions and come up with targeted interactions for our customers.
+
+**Let's take a look at our inventory: What are the most popular and profitable products?**
+
+```{r explore-data-3.1, echo=FALSE, warning=FALSE, message=FALSE}
+products_sold = initial_df %>% 
+  group_by(Description) %>%
+  summarise(NumSold = n())
+
+products_sold$Description <- factor(products_sold$Description , 
+                            levels = products_sold$Description [order(products_sold$NumSold)])
+
+ps = products_sold %>% arrange(desc(NumSold)) %>% top_n(10) %>%
+  ggplot(aes(x = Description, y = NumSold)) + 
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Product", y = "Number of Products Sold", title = "Top 10 Most Popular Products") +
+  coord_flip()
+
+products_sold_by_revenue = initial_df %>% 
+  group_by(Description) %>%
+  summarise(Revenue = sum(BasketPrice))
+
+products_sold_by_revenue$Description <- factor(products_sold_by_revenue$Description , 
+                            levels = products_sold_by_revenue$Description
+                            [order(products_sold_by_revenue$Revenue)])
+
+psr = products_sold_by_revenue %>% arrange(desc(Revenue)) %>% top_n(10) %>%
+  ggplot(aes(x = Description, y = Revenue)) + 
+  geom_bar(stat = "identity", fill = "maroon") +
+  labs(x = "Product", y = "Sales Revenue (£)", 
+       title = "Top 10 Products by Revenue") +
+  coord_flip()
+
+grid.arrange(ps, psr, nrow=2, ncol=1)
+
+```
+
+### Order Cancellations
+
+
+```{r explore-data-3.3, echo=FALSE, warning=FALSE}
+cancelled = customer_trans %>%
+  mutate(isCancelledOrder = ifelse(startsWith(InvoiceNo, "C"), 1, 0))
+
+percent = round((sum(cancelled$isCancelledOrder) /
+                   overall_info$NumberOfTransactions), 3) * 100
+```
+
+**Total number of orders cancelled: `r sum(cancelled$isCancelledOrder)`, i.e.`r percent`% of overall orders cancelled.**
+
+```{r explore-data-3.4, echo=FALSE, warning=FALSE}
+lost_rev = initial_df %>% 
+  mutate(LostRevenue = ifelse(startsWith(InvoiceNo, "C"), BasketPrice, 0))
+```
+
+```{r echo=FALSE, warning=FALSE, results='asis'}
+co = data.frame("Numumber of Cancelled Orders"=sum(cancelled$isCancelledOrder), 
+                "Total Lost Revenue"=paste("£",abs(sum(lost_rev$LostRevenue))),
+                "Total Sales Revenue"=paste("£",sum(initial_df$BasketPrice)))
+kable(co, caption = "Summary of Order Cancellations") %>% kable_styling()
+```
+
+### Insights on Product Description - Finding Keywords
+
+In our dataset, products are uniquely identified through the <b>StockCode</b> variable. A short description of the products is given in the <b>Description</b> variable. In this section, we attempt to group the products based on the product description. This information will help us better cluster our customers later, and provide crucial insights for targeting marketing.
+
+We first create a corpus of the product descriptions and apply pre-processing techniques before converting it into a Document Term Matrix (DTM). During an initial examination we found **2166 keywords** in the DTM. The most frequent ones appeared in more than **200 products**. Some of the keywords are useless. Keywords like colors do not carry much information. 
+For the final DTM these words have been discarded from the analysis, also words appearing **fewer than 20 times** have been left out. 
+
+```{r product-category-1, echo=FALSE, warning=FALSE}
+description = unique(initial_df$Description)
+corpus = tm::Corpus(tm::VectorSource(description)) 
+
+# Cleaning up 
+
+# Handling UTF-8 encoding problem from the dataset 
+corpus.cleaned = tm::tm_map(corpus, function(x) iconv(x, to='UTF-8-MAC', sub='byte'))  
+
+# Convert words to lower case
+corpus.cleaned = tm::tm_map(corpus.cleaned, tolower)
+
+# Removing stop-words 
+corpus.cleaned = tm::tm_map(corpus.cleaned, tm::removeWords, tm::stopwords('english'))
+
+# Removing specific terms
+corpus.cleaned = tm::tm_map(corpus.cleaned, tm::removeWords, 
+                             c("pink", "red", "blue", "tag", "white", "black", "green", "set"))
+
+# Trimming excessive whitespaces
+corpus.cleaned = tm::tm_map(corpus.cleaned, tm::stripWhitespace) 
+```
+
+```{r product-category-1.1, echo=FALSE, warning=FALSE}
+dtm = tm::DocumentTermMatrix(corpus.cleaned, 
+                             control=list(bounds = list(global = c(20,Inf)))) 
+#inspect(t(dtm))
+```
+
+```{r product-category-1.2, echo=FALSE, warning=FALSE}
+mat <- as.matrix(t(dtm))
+freq_words <- sort(rowSums(mat), decreasing=TRUE)
+```
+
+Let's take a look at some keywords that appear multiple times in the product descriptions:
+
+```{r product-category-1.3, echo=FALSE, warning=FALSE, message=FALSE}
+df_keywords = as.data.frame(freq_words)
+df_keywords[ "words" ] <- rownames(df_keywords)
+rownames(df_keywords) <- NULL
+
+
+df_keywords$words <- factor(df_keywords$words, 
+                            levels = df_keywords$words[order(df_keywords$freq_words)])
+
+df_keywords %>% arrange(desc(freq_words)) %>% top_n(25) %>% 
+  ggplot(aes(x = words, y = freq_words)) + 
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  labs(x = "keywords", y = "frequency ", title = "Keywords in Product Descriptions") +
+  coord_flip()
+
+```
+
+From the wordcloud below we can observe a range of different products in our inventory, i.e. **gifts** (keywords: christmas, decoration, flower, cake), or items for **home** (keywords: holder, mug, glass, bowl), or **jewelry** products (keywords: necklace, bracelet, silver, earrings).
+
+```{r echo=FALSE, warning=FALSE, fig.align = "left", fig.height = 5.0, fig.width = 8}
+set.seed(123)
+wordcloud(df_keywords$words, df_keywords$freq_word,
+          colors = brewer.pal(8, "Dark2"),
+          min.freq = 2, random.order=FALSE, rot.per=0.20,
+          scale=c(5.0,0.25))
+
+```
+
+In order to derive actionable insights it is extremely valuable to have the product categories for our customer segmentation analysis. This will help us better understand what our customers like to buy, and help us come up with better promotional and marketing strategies.
+
+# Scrape Product Categories
+
+Since, product categories can provide us with some crucial information of what kind of products a customer usually purchases, we will scrape the data from a popular online shop that has the notion of a “product category” - **Walmart**
+
+
+```{r image2, echo=FALSE, fig.cap="Product categories scraped from Walmart", out.width = '100%'}
+knitr::include_graphics("walmart.png")
+```
+
+Assuming that entering a product category for each item would take ~15 seconds, and since there are 3885 unique products in our dataset, we saved ~16 hours.
+
+The 32 product categories were scraped and written to a file for future use. Below is a list of a few selected products and the categories we matched after scraping:
+
+```{r scrape-product-categories-1, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+
+# des = des %>%
+#   mutate(ProductURL = gsub(" ", "%20", Description)) %>%
+#   mutate(ProductURL = paste("https://www.walmart.com/search/?query=", 
+#                             ProductURL, sep = ""))
+# 
+# cl = makeCluster(detectCores()-1)
+# registerDoParallel(cl)
+# t1 = Sys.time()
+# des$ProductCategory = foreach(i = seq_along(des$ProductURL),
+#                                   .packages = "rvest",
+#                                   .combine = "c",
+#                                   .errorhandling='pass') %dopar% {
+#                                     page = html_session(des$ProductURL[i]) %>%
+#                                       html_nodes(".dept-head-list-heading") %>% html_text()
+#                                     pc = "Other"
+#                                     if (length(page) > 0) {
+#                                       pc = page[[1]]
+#                                     }
+#                                     return(pc)
+#                                   }
+# t_final = Sys.time()
+# t_parallel = t_final - t1
+# write_csv(des, "product_categories1.csv")
+
+product_categories = read_csv("product_categories.csv")
+pc = product_categories %>% dplyr::select(Description, ProductCategory)
+pc = pc %>% filter(row_number() == 1 | row_number() == 3 | 
+                row_number() == 5 | row_number() == 11 |
+                row_number() == 30 | row_number() == 35)
+kable(pc, caption = "Matching descriptions with product categories scraped from Walmart") %>%
+  kable_styling()
+```
+
+Maximum products belonged to category **Home**, followed by **Part & Occasions**. This sort of verifies our findings from the *Product Insights* section above. 
+
+The plot below helps us understand the inventory of our retailer. Also, each product category on Walmart has sub-categories which the items can fall under. We have not considered those categories in our analysis as the **parent categories** our good enough for now. 
+
+```{r scrape-product-categories-1.1, echo=FALSE, warning=FALSE, message=FALSE}
+pc_plot = product_categories %>% 
+  group_by(ProductCategory) %>%
+  summarise(Count = n()) %>% arrange(desc(Count))
+
+pc_plot$ProductCategory <- factor(pc_plot$ProductCategory , 
+                                  levels = pc_plot$ProductCategory
+                                  [order(pc_plot$Count)])
+
+pc_plot %>% top_n(10) %>% ggplot(aes(x = ProductCategory, y = Count)) +
+  geom_bar(stat = "identity", fill = "maroon") + 
+  labs(x = "Product Category", y = "Count of Items Sold", 
+       title = "Top 10 Product Categories") +
+  coord_flip()
+```
+
+With the products categories now available, we have a dataset which we can use to extract customers' spending behavior, their products of interest and some basic information about their activity.
+
+# Customer Segmentation
+
+Let's use the customer’s spending behavior, their products of interest and some basic information about their activity to perform segmentation.
+
+**Useful info for our analysis are**:
+
+- Average basket value
+- Basket value range (min, max)
+- Order frequency
+- Tendency to cancel an order
+- User’s activity (first and last purchase time)
+- Products of interest
+
+Let’s group each customer and determine the **number of transactions** made by each of them, **minimum, maximum, average amount** spent on all transactions, **total amount** spent, days since **first purchase**, days since **last purchase** and finally how much each **customer spends in each category**. We now have our final dataset.
+
+```{r customer-segmentation-1, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+
+last_date = max(initial_df$InvoiceDate)
+
+customer_order_summary = initial_df %>% 
+  group_by(CustomerID) %>% 
+  summarise(n_baskets = n_distinct(InvoiceNo),
+            min_basket = min(BasketPrice),
+            avg_basket = mean(BasketPrice),
+            max_basket = max(BasketPrice),
+            total_basket = sum(BasketPrice),
+            first_purchase = min(InvoiceDate),
+            last_purchase = max(InvoiceDate)) %>%
+  mutate(first_purchase = as.integer(last_date - first_purchase),
+         last_purchase = as.integer(last_date - last_purchase))
+
+temp_df = initial_df %>% left_join(product_categories)
+
+customer_product_cat = temp_df %>% 
+  spread(ProductCategory, BasketPrice, fill = 0, convert = TRUE) %>%
+  dplyr::select(-InvoiceNo, -StockCode, -Description, -Quantity, -InvoiceDate,
+                -Month, -Year, -InvoiceTime, -HourOfDay, -UnitPrice, -Country,
+                -DayOfWeek, -ProductURL) %>%
+  group_by(CustomerID) %>% summarise_all(.funs = sum)
+
+customer_order_summary = customer_order_summary %>% left_join(customer_product_cat)
+customer_order_summary$CustomerID = as.integer(customer_order_summary$CustomerID)
+
+
+kable(customer_order_summary[1:5, c(1:8, 16:17,21, 38)], 
+      caption = "Summary of customer purchase history") %>% kable_styling(font_size = 8)
+```
+Since we have 32 product categories, not all categories have been shown in the representation above.
+
+### Statistical Clustering - K-means algorithm
+
+The segmentation will be performed using K-means clustering, which is a simple and elegant way of subsetting the customers into non-overlapping segments. There are advantages and disadvantages of this type of clustering.
+
+**Advantages:**
+
+- Relatively simple to implement.
+
+- Scales to large data sets.
+
+- Guarantees convergence.
+
+- Can warm-start the positions of centroids.
+
+- Easily adapts to new examples.
+
+- Generalizes to clusters of different shapes and sizes, such as elliptical clusters.
+
+**Disadvantages:**
+
+- Choosing 'k' manually: Use the “Loss vs. Clusters” plot to find the optimal (k)
+
+- Being dependent on initial values: For a low , you can mitigate this dependence by running k-means several times with different initial values and picking the best result.
+
+- Clustering data of varying sizes and density: K-means has trouble clustering data where clusters are of varying sizes and density. To cluster such data, you need to generalize k-means as described in the Advantages section.
+
+
+<b>Importance of scaling the data before performing K-means: </b>
+
+In our dataframe for customer segmentation described above, variables are measured in different units, where a unit increase or decrease in one day for **first_purchase** and **last_purchase** is completely different than a unit increase or decrease in pounds for **total_basket**. Therefore the importance of scaling the data, to represent the true distance among variables. The data has been scaled using the function scale().
+
+<b>Choosing the oprimal number of clusters: </b>
+
+As we learned before, the k-means algorithm doesn’t choose the optimal number of clusters upfront, but there are different techniques to make the selection. The most popular ones are within cluster sums of squares, average silhouette and gap statistics.  The silhouette statistic for a single element compares its mean inner-cluster distance to the mean distance from the neighbouring cluster. It varies from -1 to 1, where high positive values mean the element is correctly assigned to the current cluster, while negative values signify it’s better to assign it to neighbouring one. Here we present average silhouette across all data points:
+
+```{r customer-segmentation-1.1, echo=FALSE, warning=FALSE}
+
+# 1. Loading and preparing data
+scaled_cutomer_order_summary = as.data.frame(scale(customer_order_summary))
+
+# 2. Find optimal number of clusters for k-means
+fviz_nbclust(scaled_cutomer_order_summary, kmeans, method='silhouette')
+```
+
+As you can see above, the optimal number of clusters is 3 hands-down. So let’s choose 3.
+
+```{r customer-segmentation-1.2, echo=FALSE, warning=FALSE}
+set.seed(123)
+# 3. Compute k-means
+km_model = kmeans(scaled_cutomer_order_summary, 3, nstart = 25)
+
+customer_order_summary$Cluster = km_model$cluster
+```
+
+**Let's verify if the clusters were extracted correctly?**
+
+Our dataset stores 40 variables, so it’s impossible to compare assigned clusters across all variables (readable visualisations are restricted to a maximum 3 dimensions).
+
+One of the most popular approaches that helps solve the problem is **Principal Component Analysis (PCA)**. PCA combines variables of a provided dataset to create new ones, called PCA components, that capture most of the dataset variation. Plotting clusters distribution across first PCA components should allow us to see if the clusters are separated or not. 
+
+```{r customer-segmentation-1.3, echo=FALSE, warning=FALSE}
+pca <- PCA(scaled_cutomer_order_summary,  graph = FALSE)
+fviz_screeplot(pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+For this case, let’s plot how the clusters were distributed comparing the 1st vs. the 2nd, as well as the 1st vs. the 3rd PCA components.
+
+```{r customer-segmentation-1.4, echo=FALSE, warning=FALSE}
+fviz_cluster(km_model, data = scaled_cutomer_order_summary,
+             axes = c(1,2),
+             geom = "point",
+             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+             ggtheme = theme_minimal(),
+             main = "Partitioning Clustering Plot Dim1 vs. Dim2")
+
+fviz_cluster(km_model, data = scaled_cutomer_order_summary,
+             axes = c(1,3),
+             geom = "point",
+             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+             ggtheme = theme_minimal(),
+             main = "Partitioning Clustering Plot Dim1 vs. Dim3")
+```
+
+From the plots above we can certainly conclude that all the three clusters are well seperated, there is no overlap whatsoever. To sum up, we’re happy with this result and we can now move to the next part of our analysis.
+
+<b> How can we detect which indicators along 40 variables distinguish our customers? </b>
+
+### RFM Analysis: (Recency, Frequency, Monetary)
+
+Recency, frequency, monetary value is a marketing analysis tool used to identify a company's or an organization's best customers by using certain measures. The RFM model is based on three quantitative factors:
+
+- Recency: How recently a customer has made a purchase
+- Frequency: How often a customer makes a purchase
+- Monetary Value: How much money a customer spends on purchases
+
+Below is a summary table that explains the differences in the three clusters.
+
+```{r customer-segmentation-1.5, echo=FALSE, warning=FALSE, results='asis'}
+cluster_diff = customer_order_summary %>% group_by(Cluster) %>%
+  summarise('Number of Customers' = n(),
+            'Recency Mean' = round(mean(last_purchase)),
+            'Frequency Mean' = scales::comma(round(mean(n_baskets))),
+            'Monetary Value Mean' = scales::comma(round(mean(total_basket))),
+            'Cluster Revenue' = scales::comma(sum(total_basket)))
+kable(cluster_diff, caption = "Diffreence between the three clusters") %>% kable_styling()
+```
+
+In general, it’s necessary to analyse distributions for each variable grouped by the assigned cluster. Boxplots could be used to analyze the distributions of the relevant variables. Below we present box plots to analyze Recency, Frequency and Monetary in each of the three cluster.
+
+```{r customer-segmentation-1.6, echo=FALSE, warning=FALSE, fig.height = 8, fig.width = 8}
+customer_order_summary$Cluster = as.factor(customer_order_summary$Cluster)
+
+r = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = last_purchase, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3", "orangered3")) +
+  labs(x = "Cluster", y = "Number of Days",
+       title = "Recency: Distribution of Days since Last Order") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+
+f = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = n_baskets, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3", "orangered3")) +
+  labs(x = "Cluster", y = "Number of Transactions",
+       title = "Frequency: Distribution of Transactions") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+
+m = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = total_basket, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3", "orangered3")) +
+  labs(x = "Cluster", y = "Order Value (£)",
+       title = "Monetary: Distribution of Order Value") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+grid.arrange(r, f, m, nrow = 3)
+```
+
+From the above summary we can detect a few simple characteristics about customers in each cluster.
+
+<b> Cluster 1 (Blue):</b>
+
+- Tends to spend a lot of money for each basket, £241,083 on average.
+- They order in bulk.
+- Products of interest for the group are varied.
+- The clients on average are also the most active in the recent past.
+- We can classify the group as high value customers (Wholesalers).
+
+
+<b> Cluster 2 (Golden): </b>
+
+- Tends to spend moderate amount of money on each basket, £57,323 on average.
+- They order the highest number of baskets on average.
+- Spend moderately across each product category.
+- The clients order weekly on average.
+- We can classify the group as regular customers.
+
+
+<b> Cluster 3 (Red): </b>
+
+- Tends to spend a low amount of money for each basket, £1,448 on average.
+- The number of transactions are extremenly low, 5 baskets on average.
+- The clients on average are least active in the recent past, take months before their next purchase.
+- We can classify the group as typical bargain hunters (Non-Wholesalers).
+
+
+### Products of Interest within each Cluster
+
+Next, let's analyze the tendency of each of the three clusters for buying a product in a specific category. 
+
+Categories **Home** and **Part & Ocassions** have been left out as they generate maximum revenue for each of the three clusters. We'll focus on a few other catgories that boost sales within and across the three clusters. 
+
+```{r customer-segmentation-1.7, echo=FALSE, warning=FALSE}
+
+product_stats_cluster =  customer_order_summary %>%
+  dplyr::select(-CustomerID, -n_baskets, -min_basket, -avg_basket, 
+                -max_basket, -total_basket, -first_purchase, -last_purchase)
+
+product_stats_cluster = 
+  product_stats_cluster %>% gather(key = "ProductCategory", value = "BasketValue", -Cluster) 
+
+product_stats_cluster %>% 
+  filter(ProductCategory %in% c("Arts Crafts & Sewing", "Jewelry", 
+                                "Clothing", "Office Supplies",
+                                "Toys", "Pets", "Food",
+                                "Patio & Garden")) %>%
+  ggplot(aes(x = ProductCategory, BasketValue)) +
+  stat_summary(fun.y=sum,geom="bar",fill="#CC6666",colour="black") +
+  labs(x = "Product Category", y = "Sales Revenue (£)",
+       title = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~Cluster, scales = "free") 
+```
+
+From the bar plots above we can summarize the tendency for buying in a specfic category. 
+
+<b> Cluster 1: </b>
+
+- Customers spend a lot on Office Supplies, followed by Patio & Garden and Clothing.
+- They spend less on Jewelry and Food products,
+- Spend the most on products for Pets across the three clusters.
+
+<b> Cluster 2: </b>
+
+- Spend most on Toys, followed by Clothing and Arts Crafts & Sewing.
+- Least sales revenue from products for Pets.
+
+<b> Cluster 3: </b>
+
+- Spend most on Clothing, followed by Toys and Office Supplies.
+- Least sales revenue from products for Pets.
+
+# Further Segmentation - Hiererchical Clustering
+
+To enhance this clustering analysis it was decided to further segment the largest cluster of customer in the first segementation (Cluster 3), this further sub-segmentation was performed using hierechical clustering to further understand the customer characteristics of this group.
+
+Monetary Value was selected as the value for the further segmentation, using frequency and recency as estimators for it.
+
+```{r customer-segmentation-1.8, echo=FALSE, warning=FALSE}
+tree_cluster3 = customer_order_summary %>%
+  filter(Cluster == '3') %>%
+  dplyr::select(n_baskets, total_basket, last_purchase)
+
+fit_tree  = rpart(total_basket ~ ., 
+                 data = tree_cluster3,
+                 method = 'anova', 
+                 control = rpart.control(cp=0.0127102))
+
+rpart.plot(fit_tree, type=1,extra=1, box.palette=c("gray","lightblue"))
+```
+
+This sub-segmentation of Cluster 3, divided the cluster into 7 smaller different clusters.
+
+<b> Results: (From low value to high value customers) </b>
+
+- 2,130 customers that purchase less than 3 times, average monetary value of £412.
+
+- 1,156 customers that purchase greater than 3 times but lesser than 6 times, average monetary value of £1,166 (significantly higher than the previous group).
+
+- 550 customers that purchase greater than 6 times but lesser than 10 times, average monetary value of £2,159.
+
+- 323 customers that purchase greater than 10 times but lesser than 17 times, average monetary value of £3,738.
+
+- 167 customers that purchase greater than 17 times and lesser than 41 times, average monetary value of £7,532.
+
+- 12 customers that purchase greater than 41 times and lesser than 52 times, average monetary value of £15,000.
+
+- 10 customers that purchase greater than 52 times, average monetary value of £24,000.
+
+This last sub-segment of 10 customers represents the most valuable customers within Cluster 3. From these insights, executive and management team can take further strategic actions to increase the averague monetary value of lower sub-segments within this cluster of customers.
+
+
+# How can we use the results for targeted marketing?
+
+We were able to group our customers based on their purchase behaviour and we managed to detect meaningful factors for each group. The best way forward is to prepare specific interactions for each one.
+
+Here are some ideas:
+
+1. For **Cluster 1**, all the high-value customers may be entrepreneurs, so they order wholesale quantities of products. We can prepare an offer for them to get an extra discount when they buy in bulk. Also, target advertisement for Pets' products.
+
+2. As for regular customers in **Cluster 2**, they might be encouraged to return if we inform them about new and/or unique products from our line. We could even include recommendations from the appropriate influencers. Let them know about discounts on Toys and Clothing or about new products in these categories.
+
+3. We can target the top 22 customers obtained from further segmenting Cluster 3 using similar strategies as for other wholesalers and customers who buy in bulk. For other customers in **Cluster 3**, we can offer selected promotions for products from their categories of interest. We could periodically send the discount offers by email or show the message right after the user logs in to our website.
+
+# Summary
+ 
+To sum up, by answering a few questions about the data and applying popular clustering methods we managed to get interesting information about our clients. 
+
+In this analysis we analyzed sales trends, market profitability, order cancellations and product categories through exploratory data analysis. We scraped product categories from Walmart's website and created a dataframe to summarize customers' purchase history. This dataframe was used to perform customer segmentation. The clusters obtanined by implementing k-means and hierarchical clustering algorithms helped us segment our customers in order to gain insight into their shopping behaviors, analyze product affinity for each cluster, measure marketing effectiveness, and better allocate future marketing spend.
+
+
